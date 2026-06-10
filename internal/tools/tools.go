@@ -56,9 +56,19 @@ func (r *Registry) Tools() []mcp.Tool {
 			Name:        "analyze_failure_patterns",
 			Description: "Summarize top failure signatures from recent failed attempts.",
 			InputSchema: objectSchema(map[string]any{
-				"limit": numberSchema("Maximum number of failure signatures to return (default 10, max 100)."),
+				"run_id": map[string]any{"type": "string", "description": "Optional run ID to scope analysis to a single run."},
+				"limit":  numberSchema("Maximum number of failure signatures to return (default 10, max 100)."),
 			}),
 			Handler: r.analyzeFailurePatterns,
+		},
+		{
+			Name:        "analyze_failure_patterns_by_test",
+			Description: "Group failure signatures by test for triage (test + error message + count).",
+			InputSchema: objectSchema(map[string]any{
+				"run_id": map[string]any{"type": "string", "description": "Optional run ID to scope analysis to a single run."},
+				"limit":  numberSchema("Maximum number of grouped rows to return (default 20, max 200)."),
+			}),
+			Handler: r.analyzeFailurePatternsByTest,
 		},
 		{
 			Name:        "get_live_step_buffer",

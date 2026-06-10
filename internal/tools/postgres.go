@@ -28,6 +28,15 @@ type failurePattern struct {
 	Count        int64  `json:"count"`
 }
 
+type failurePatternByTest struct {
+	RunID        string `json:"run_id"`
+	TestID       string `json:"test_id"`
+	TestName     string `json:"test_name"`
+	ErrorMessage string `json:"error_message"`
+	Status       string `json:"status"`
+	Count        int64  `json:"count"`
+}
+
 func (r *Registry) listTestRuns(_ mcp.CallContext, args map[string]any) (any, error) {
 	if r.pg == nil {
 		return nil, fmt.Errorf("postgres connection is not available")
@@ -136,16 +145,23 @@ func (r *Registry) analyzeFailurePatterns(_ mcp.CallContext, args map[string]any
 	if err != nil {
 		return nil, err
 	}
+	runID, err := stringArg(args, "run_id")
+	if err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := r.timeoutContext()
 	defer cancel()
 
 	results := make([]failurePattern, 0, limit)
-	err = r.pg.WithContext(ctx).
+	q := r.pg.WithContext(ctx).
 		Table("test_attempts").
 		Select("COALESCE(NULLIF(error_message, ''), 'no_error_message') AS error_message, COALESCE(NULLIF(status, ''), 'unknown') AS status, COUNT(*)::bigint AS count").
-		Where("UPPER(status) IN ?", []string{"FAILED", "BROKEN", "TIMEDOUT"}).
-		Group("1, 2").
+		Where("UPPER(status) IN ?", []string{"FAILED", "BROKEN", "TIMEDOUT"})
+	if runID != "" {
+		q = q.Where("run_id = ?", runID)
+	}
+	err = q.Group("1, 2").
 		Order("count DESC").
 		Limit(limit).
 		Scan(&results).Error
@@ -153,5 +169,43 @@ func (r *Registry) analyzeFailurePatterns(_ mcp.CallContext, args map[string]any
 		return nil, fmt.Errorf("query failure patterns: %w", err)
 	}
 
-	return map[string]any{"patterns": results, "count": len(results)}, nil
+	return map[string]any{"patterns": results, "count": len(results), "run_id": runID}, nil
+}
+
+func (r *Registry) analyzeFailurePatternsByTest(_ mcp.CallContext, args map[string]any) (any, error) {
+	if r.pg == nil {
+		return nil, fmt.Errorf("postgres connection is not available")
+	}
+
+	limit, err := intArg(args, "limit", 20, 200)
+	if err != nil {
+		return nil, err
+	}
+	runID, err := stringArg(args, "run_id")
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := r.timeoutContext()
+	defer cancel()
+
+	results := make([]failurePatternByTest, 0, limit)
+	q := r.pg.WithContext(ctx).
+		Table("test_attempts ta").
+		Select("ta.run_id, ta.test_id, COALESCE(NULLIF(t.name, ''), t.title, ta.test_id) AS test_name, COALESCE(NULLIF(ta.error_message, ''), 'no_error_message') AS error_message, COALESCE(NULLIF(ta.status, ''), 'unknown') AS status, COUNT(*)::bigint AS count").
+		Joins("LEFT JOIN tests t ON t.id = ta.test_id AND t.run_id = ta.run_id").
+		Where("UPPER(ta.status) IN ?", []string{"FAILED", "BROKEN", "TIMEDOUT"})
+	if runID != "" {
+		q = q.Where("ta.run_id = ?", runID)
+	}
+	err = q.Group("ta.run_id, ta.test_id, test_name, error_message, ta.status").
+		Order("count DESC").
+		Order("test_name ASC").
+		Limit(limit).
+		Scan(&results).Error
+	if err != nil {
+		return nil, fmt.Errorf("query failure patterns by test: %w", err)
+	}
+
+	return map[string]any{"patterns": results, "count": len(results), "run_id": runID}, nil
 }
