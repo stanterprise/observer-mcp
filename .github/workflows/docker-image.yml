@@ -1,0 +1,129 @@
+name: Docker Image Publishing
+
+# Optimized multi-platform builds with BuildKit cache mounts
+# - Uses registry cache for cross-runner cache sharing
+# - Multi-platform (AMD64 + ARM64) for all non-PR builds
+# - Expected build times: 8-12 min (first), 2-4 min (cached)
+
+on:
+  push:
+    branches:
+      - master
+      - develop
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Check if SHA image already exists
+        if: github.event_name != 'pull_request' && github.ref_type != 'tag'
+        id: check_sha
+        run: |
+          SHA_IMAGE=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | grep -m1 ':sha-' || true)
+          echo "sha_image=${SHA_IMAGE}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "${SHA_IMAGE}" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No SHA image tag found in metadata output. Building from scratch."
+          elif INSPECT_OUT=$(docker buildx imagetools inspect "${SHA_IMAGE}" 2>&1); then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "SHA image already exists: ${SHA_IMAGE}. Retagging instead of rebuilding."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "SHA image not found: ${SHA_IMAGE}. Building from scratch."
+            echo "Inspect output: ${INSPECT_OUT}"
+          fi
+
+      - name: Build and push Docker image
+        id: build
+        if: github.event_name == 'pull_request' || steps.check_sha.outputs.exists != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ (github.event_name != 'pull_request') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache', env.REGISTRY, env.IMAGE_NAME) || 'type=gha' }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || 'type=gha,mode=max' }}
+
+      - name: Retag existing image
+        if: github.event_name != 'pull_request' && github.ref_type != 'tag' && steps.check_sha.outputs.exists == 'true'
+        run: |
+          SHA_IMAGE="${{ steps.check_sha.outputs.sha_image }}"
+          TAGS="${{ steps.meta.outputs.tags }}"
+          TAG_ARGS=()
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            [ "$tag" = "$SHA_IMAGE" ] && continue
+            TAG_ARGS+=(-t "$tag")
+          done <<< "$TAGS"
+          if [ "${#TAG_ARGS[@]}" -eq 0 ]; then
+            echo "No destination tags to apply after excluding source image ${SHA_IMAGE}"
+            exit 1
+          fi
+          echo "Retagging ${SHA_IMAGE} with: ${TAG_ARGS[*]}"
+          docker buildx imagetools create "${TAG_ARGS[@]}" "$SHA_IMAGE"
+
+      - name: Report build performance
+        if: always()
+        run: |
+          echo "### Build Performance" >> $GITHUB_STEP_SUMMARY
+          echo "**Platform(s):** ${{ (github.event_name != 'pull_request') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check_sha.outputs.exists }}" = "true" ]; then
+            echo "**Action:** Retagged existing image (no rebuild)" >> $GITHUB_STEP_SUMMARY
+            echo "**Source:** \`${{ steps.check_sha.outputs.sha_image }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Cache Strategy:** ${{ github.event_name != 'pull_request' && 'Registry cache' || 'GitHub Actions cache' }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Build Status:** ${{ steps.build.outcome }}" >> $GITHUB_STEP_SUMMARY
+          fi

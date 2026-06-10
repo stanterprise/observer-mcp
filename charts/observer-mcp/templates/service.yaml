@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "observer-mcp.fullname" . }}
+  labels:
+    {{- include "observer-mcp.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "observer-mcp.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: mcp-http
+    port: {{ .Values.service.port }}
+    targetPort: mcp-http
+    protocol: TCP
+  - name: health
+    port: {{ .Values.service.healthPort }}
+    targetPort: health
+    protocol: TCP
