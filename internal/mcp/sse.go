@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 )
+
+const sseKeepAliveInterval = 25 * time.Second
 
 // SSEHandler implements the MCP HTTP+SSE transport.
 //
@@ -66,23 +69,39 @@ func (h *SSEHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 	defer h.sessions.Delete(sessionID)
 
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	// Announce the POST endpoint to the client.
-	fmt.Fprintf(w, "event: endpoint\ndata: /message?sessionId=%s\n\n", sessionID)
+	if _, err := fmt.Fprintf(w, "event: endpoint\ndata: /message?sessionId=%s\n\n", sessionID); err != nil {
+		h.logger.Warn("failed writing SSE endpoint announcement", "session", sessionID, "error", err)
+		return
+	}
 	flusher.Flush()
 
 	h.logger.Info("SSE session opened", "session", sessionID)
+
+	keepAliveTicker := time.NewTicker(sseKeepAliveInterval)
+	defer keepAliveTicker.Stop()
 
 	for {
 		select {
 		case <-r.Context().Done():
 			h.logger.Info("SSE session closed", "session", sessionID)
 			return
+		case <-keepAliveTicker.C:
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				h.logger.Warn("failed writing SSE keepalive", "session", sessionID, "error", err)
+				return
+			}
+			flusher.Flush()
 		case data := <-sess.ch:
-			fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
+			if _, err := fmt.Fprintf(w, "event: message\ndata: %s\n\n", data); err != nil {
+				h.logger.Warn("failed writing SSE message", "session", sessionID, "error", err)
+				return
+			}
 			flusher.Flush()
 		}
 	}

@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,10 @@ type Server struct {
 }
 
 func NewServer(logger *slog.Logger, tools []Tool) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	toolMap := make(map[string]Tool, len(tools))
 	for _, tool := range tools {
 		toolMap[tool.Name] = tool
@@ -36,6 +41,13 @@ func (s *Server) Serve(ctx context.Context, stdin io.Reader, stdout io.Writer) e
 			if err == io.EOF {
 				return nil
 			}
+
+			var protocolErr *recoverableProtocolError
+			if errors.As(err, &protocolErr) {
+				s.logger.Warn("ignoring malformed MCP request", "error", protocolErr.Error())
+				continue
+			}
+
 			return fmt.Errorf("read request: %w", err)
 		}
 
